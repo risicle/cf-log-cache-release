@@ -248,21 +248,21 @@ func (store *Store) truncate() {
 
 	numberToPrune := store.mc.GetQuantityToPrune(storeCount)
 
+	// Just make sure we don't try to prune more entries than we have
+	if numberToPrune > int(storeCount) {
+		numberToPrune = int(storeCount)
+	}
+
 	if numberToPrune == 0 {
 		store.sendTruncationCompleted(false)
 		atomic.CompareAndSwapInt64(&store.consecutiveTruncation, store.consecutiveTruncation, 0)
 		return
 	}
 
-	// Just make sure we don't try to prune more entries than we have
-	if numberToPrune > int(storeCount) {
-		numberToPrune = int(storeCount)
-	}
-
 	expirationHeap := store.BuildExpirationHeap()
 
 	// Remove envelopes one at a time, popping state from the expirationHeap
-	for i := 0; i < numberToPrune; i++ {
+	for i := 0; i < numberToPrune && expirationHeap.Len() > 0; i++ {
 		oldest := heap.Pop(expirationHeap)
 		newOldestTimestamp, valid := store.removeOldestEnvelope(oldest.(storageExpiration).tree, oldest.(storageExpiration).sourceId)
 		if valid {
