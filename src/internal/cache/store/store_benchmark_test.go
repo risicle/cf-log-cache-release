@@ -184,16 +184,13 @@ func benchmarkMeta(b *testing.B, prunerMax int) {
 	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
 
 	genReset()
-	// meta calls are so fast we need to reduce the number of
-	// Put()s per b.N else adaptive benchtime will scale b.N
-	// way up to the point we're running out of memory
-	for i := 0; i < (b.N / 5) + 1; i++ {
+	for i := 0; i < b.N; i++ {
 		e := genGet()
 		s.Put(e, e.GetSourceId())
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < b.N * 5; i++ {
 		metaResults = s.Meta()
 	}
 }
@@ -222,7 +219,7 @@ func benchmarkMetaWhileWriting(b *testing.B, prunerMax int) {
 	<-ready
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < b.N * 5; i++ {
 		metaResults = s.Meta()
 	}
 }
@@ -242,10 +239,7 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 	genReset()
 	oldestTimestamp := MaxTime.UnixNano()
 	newestTimestamp := MinTime.UnixNano()
-	// meta calls are so fast we need to reduce the number of
-	// Put()s per b.N else adaptive benchtime will scale b.N
-	// way up to the point we're running out of memory
-	for i := 0; i < (b.N / 2)+1; i++ {
+	for i := 0; i < b.N; i++ {
 		e := genGet()
 		if e.Timestamp < oldestTimestamp {
 			oldestTimestamp = e.Timestamp
@@ -278,7 +272,7 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 	<-ready
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < b.N * 5; i++ {
 		metaResults = s.Meta()
 	}
 }
