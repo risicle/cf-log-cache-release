@@ -262,7 +262,7 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 		for i := 0; i < b.N; i++ {
 			startTimestamp := time.Unix(
 				0,
-				rand.Int63n(1 + newestTimestamp - oldestTimestamp) + oldestTimestamp,
+				rand.Int63n((newestTimestamp - oldestTimestamp) | 1) + oldestTimestamp,
 			)
 			results = s.Get(
 				getRandomSourceId(),
@@ -323,7 +323,7 @@ func benchmarkReadingWhileWriting(b *testing.B, prunerMax int) {
 		for i := 0; i < b.N; i++ {
 			startTimestamp := time.Unix(
 				0,
-				rand.Int63n(1 + newestTimestampAtomic.Load() - oldestTimestamp) + oldestTimestamp,
+				rand.Int63n((newestTimestampAtomic.Load() - oldestTimestamp) | 1) + oldestTimestamp,
 			)
 			results = s.Get(
 				getRandomSourceId(),
