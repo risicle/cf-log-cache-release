@@ -187,7 +187,7 @@ func benchmarkMeta(b *testing.B, prunerMax int) {
 	// meta calls are so fast we need to reduce the number of
 	// Put()s per b.N else adaptive benchtime will scale b.N
 	// way up to the point we're running out of memory
-	for i := 0; i < b.N / 5; i++ {
+	for i := 0; i < (b.N / 5) + 1; i++ {
 		e := genGet()
 		s.Put(e, e.GetSourceId())
 	}
@@ -245,7 +245,7 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 	// meta calls are so fast we need to reduce the number of
 	// Put()s per b.N else adaptive benchtime will scale b.N
 	// way up to the point we're running out of memory
-	for i := 0; i < b.N / 2; i++ {
+	for i := 0; i < (b.N / 2)+1; i++ {
 		e := genGet()
 		if e.Timestamp < oldestTimestamp {
 			oldestTimestamp = e.Timestamp
@@ -262,7 +262,7 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 		for i := 0; i < b.N; i++ {
 			startTimestamp := time.Unix(
 				0,
-				rand.Int63n((newestTimestamp - oldestTimestamp) | 1) + oldestTimestamp,
+				rand.Int63n(1 + newestTimestamp - oldestTimestamp) + oldestTimestamp,
 			)
 			results = s.Get(
 				getRandomSourceId(),
@@ -323,7 +323,7 @@ func benchmarkReadingWhileWriting(b *testing.B, prunerMax int) {
 		for i := 0; i < b.N; i++ {
 			startTimestamp := time.Unix(
 				0,
-				rand.Int63n((newestTimestampAtomic.Load() - oldestTimestamp) | 1) + oldestTimestamp,
+				rand.Int63n(1 + newestTimestampAtomic.Load() - oldestTimestamp) + oldestTimestamp,
 			)
 			results = s.Get(
 				getRandomSourceId(),
