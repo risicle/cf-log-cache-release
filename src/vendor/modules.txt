@@ -75,6 +75,9 @@ github.com/emirpasic/gods/utils
 # github.com/fsnotify/fsnotify v1.6.0
 ## explicit; go 1.16
 github.com/fsnotify/fsnotify
+# github.com/gammazero/deque v0.2.1
+## explicit; go 1.18
+github.com/gammazero/deque
 # github.com/go-kit/kit v0.9.0
 ## explicit
 github.com/go-kit/kit/log

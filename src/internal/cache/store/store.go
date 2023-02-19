@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"regexp"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,8 +13,8 @@ import (
 
 	"code.cloudfoundry.org/go-log-cache/rpc/logcache_v1"
 	"code.cloudfoundry.org/go-loggregator/v9/rpc/loggregator_v2"
-	"github.com/emirpasic/gods/trees/avltree"
-	"github.com/emirpasic/gods/utils"
+
+	"github.com/gammazero/deque"
 )
 
 type MetricsRegistry interface {
@@ -139,7 +140,7 @@ func (store *Store) getOrInitializeStorage(sourceId string) (*storage, bool) {
 	if !existingSourceId {
 		envelopeStorage = &storage{
 			sourceId: sourceId,
-			Tree:     avltree.NewWith(utils.Int64Comparator),
+			envDeque: deque.New[loggregator_v2.Envelope](128, 128),
 		}
 		store.storageIndex.Store(sourceId, envelopeStorage.(*storage))
 		newStorage = true
@@ -153,9 +154,8 @@ func (storage *storage) insertOrSwap(store *Store, e *loggregator_v2.Envelope) {
 	defer storage.Unlock()
 
 	// If we're at our maximum capacity, remove an envelope before inserting
-	if storage.Size() >= store.maxPerSource {
-		oldestTimestamp := storage.Left().Key.(int64)
-		storage.Remove(oldestTimestamp)
+	if storage.Len() >= store.maxPerSource {
+		storage.PopBack()
 		storage.meta.Expired++
 		store.metrics.expired.Add(1)
 	} else {
@@ -163,25 +163,20 @@ func (storage *storage) insertOrSwap(store *Store, e *loggregator_v2.Envelope) {
 		store.metrics.storeSize.Set(float64(atomic.LoadInt64(&store.count)))
 	}
 
-	var timestampFudge int64
-	for timestampFudge = 0; timestampFudge < store.maxTimestampFudge; timestampFudge++ {
-		_, exists := storage.Get(e.Timestamp + timestampFudge)
+	insertionIndex := sort.Search(storage.Len(), func(i int) bool {
+		return storage.At(i).Timestamp <= e.Timestamp
+	})
 
-		if !exists {
-			break
-		}
-	}
-
-	storage.Put(e.Timestamp+timestampFudge, e)
+	storage.Insert(insertionIndex, *e)
 
 	if e.Timestamp > storage.meta.NewestTimestamp {
 		storage.meta.NewestTimestamp = e.Timestamp
 	}
 
-	oldestTimestamp := storage.Left().Key.(int64)
+	oldestTimestamp := storage.Back().Timestamp
 	storage.meta.OldestTimestamp = oldestTimestamp
 	storeOldestTimestamp := atomic.LoadInt64(&store.oldestTimestamp)
-
+	// FIXME wat
 	if oldestTimestamp < storeOldestTimestamp {
 		atomic.StoreInt64(&store.oldestTimestamp, oldestTimestamp)
 		storeOldestTimestamp = oldestTimestamp
@@ -230,11 +225,15 @@ func (store *Store) BuildExpirationHeap() *ExpirationHeap {
 	expirationHeap := &ExpirationHeap{}
 	heap.Init(expirationHeap)
 
-	store.storageIndex.Range(func(sourceId interface{}, tree interface{}) bool {
-		tree.(*storage).RLock()
-		oldestTimestamp := tree.(*storage).Left().Key.(int64)
-		heap.Push(expirationHeap, storageExpiration{timestamp: oldestTimestamp, sourceId: sourceId.(string), tree: tree.(*storage)})
-		tree.(*storage).RUnlock()
+	store.storageIndex.Range(func(sourceId interface{}, queue interface{}) bool {
+		queue.(*storage).RLock()
+		oldestTimestamp := queue.(*storage).Back().Timestamp
+		heap.Push(expirationHeap, storageExpiration{
+			timestamp: oldestTimestamp,
+			sourceId: sourceId.(string),
+			queue: queue.(*storage),
+		})
+		queue.(*storage).RUnlock()
 
 		return true
 	})
@@ -242,19 +241,21 @@ func (store *Store) BuildExpirationHeap() *ExpirationHeap {
 	return expirationHeap
 }
 
-// truncate removes the n oldest envelopes across all trees
+// truncate removes the n oldest envelopes across all queues
 func (store *Store) truncate() {
 	storeCount := atomic.LoadInt64(&store.count)
 
 	numberToPrune := store.mc.GetQuantityToPrune(storeCount)
 
 	// Just make sure we don't try to prune more entries than we have
+	// FIXME why?
 	if numberToPrune > int(storeCount) {
 		numberToPrune = int(storeCount)
 	}
 
 	if numberToPrune == 0 {
 		store.sendTruncationCompleted(false)
+		// FIXME wat
 		atomic.CompareAndSwapInt64(&store.consecutiveTruncation, store.consecutiveTruncation, 0)
 		return
 	}
@@ -264,9 +265,19 @@ func (store *Store) truncate() {
 	// Remove envelopes one at a time, popping state from the expirationHeap
 	for i := 0; i < numberToPrune && expirationHeap.Len() > 0; i++ {
 		oldest := heap.Pop(expirationHeap)
-		newOldestTimestamp, valid := store.removeOldestEnvelope(oldest.(storageExpiration).tree, oldest.(storageExpiration).sourceId)
+		newOldestTimestamp, valid := store.removeOldestEnvelope(
+			oldest.(storageExpiration).queue,
+			oldest.(storageExpiration).sourceId,
+		)
 		if valid {
-			heap.Push(expirationHeap, storageExpiration{timestamp: newOldestTimestamp, sourceId: oldest.(storageExpiration).sourceId, tree: oldest.(storageExpiration).tree})
+			heap.Push(
+				expirationHeap,
+				storageExpiration{
+					timestamp: newOldestTimestamp,
+					sourceId: oldest.(storageExpiration).sourceId,
+					queue: oldest.(storageExpiration).queue,
+				},
+			)
 		}
 	}
 
@@ -285,7 +296,7 @@ func (store *Store) truncate() {
 	}
 
 	// Otherwise, grab the next oldest timestamp and use it to update the cache period
-	if oldest := expirationHeap.Pop(); oldest.(storageExpiration).tree != nil {
+	if oldest := expirationHeap.Pop(); oldest.(storageExpiration).queue != nil {
 		atomic.StoreInt64(&store.oldestTimestamp, oldest.(storageExpiration).timestamp)
 		cachePeriod := calculateCachePeriod(oldest.(storageExpiration).timestamp)
 		store.metrics.cachePeriod.Set(float64(cachePeriod))
@@ -295,35 +306,33 @@ func (store *Store) truncate() {
 
 	if store.consecutiveTruncation >= store.prunesPerGC {
 		runtime.GC()
+		// FIXME wat
 		atomic.CompareAndSwapInt64(&store.consecutiveTruncation, store.consecutiveTruncation, 0)
 	}
 }
 
-func (store *Store) removeOldestEnvelope(treeToPrune *storage, sourceId string) (int64, bool) {
-	treeToPrune.Lock()
-	defer treeToPrune.Unlock()
+func (store *Store) removeOldestEnvelope(queueToPrune *storage, sourceId string) (int64, bool) {
+	queueToPrune.Lock()
+	defer queueToPrune.Unlock()
 
-	if treeToPrune.Size() == 0 {
+	if queueToPrune.Len() == 0 {
 		return 0, false
 	}
 
 	atomic.AddInt64(&store.count, -1)
 	store.metrics.expired.Add(1)
 
-	oldestEnvelope := treeToPrune.Left()
+	queueToPrune.PopBack()
 
-	treeToPrune.Remove(oldestEnvelope.Key.(int64))
-
-	if treeToPrune.Size() == 0 {
+	if queueToPrune.Len() == 0 {
 		store.storageIndex.Delete(sourceId)
 		return 0, false
 	}
 
-	newOldestEnvelope := treeToPrune.Left()
-	oldestTimestampAfterRemoval := newOldestEnvelope.Key.(int64)
+	oldestTimestampAfterRemoval := queueToPrune.Back().Timestamp
 
-	treeToPrune.meta.Expired++
-	treeToPrune.meta.OldestTimestamp = oldestTimestampAfterRemoval
+	queueToPrune.meta.Expired++
+	queueToPrune.meta.OldestTimestamp = oldestTimestampAfterRemoval
 
 	return oldestTimestampAfterRemoval, true
 }
@@ -339,33 +348,51 @@ func (store *Store) Get(
 	limit int,
 	descending bool,
 ) []*loggregator_v2.Envelope {
-	tree, ok := store.storageIndex.Load(index)
-	if !ok {
+	if start.After(end) {
 		return nil
 	}
 
-	tree.(*storage).RLock()
-	defer tree.(*storage).RUnlock()
+	queueAny, ok := store.storageIndex.Load(index)
+	if !ok {
+		return nil
+	}
+	queue := queueAny.(*storage)
 
-	traverser := store.treeAscTraverse
+	queue.RLock()
+	defer queue.RUnlock()
+
+
+	startIndex := sort.Search(queue.Len(), func(i int) bool {
+		return queue.At(i).Timestamp < start.UnixNano()
+	})
+	endIndex := sort.Search(queue.Len(), func(i int) bool {
+		return queue.At(i).Timestamp < end.UnixNano()
+	})
+
+	var step int
 	if descending {
-		traverser = store.treeDescTraverse
+		step = 1
+		startIndex, endIndex = endIndex, startIndex
+	} else {
+		step = -1
+		// make startIndex inclusive and endIndex exclusive as
+		// we're stepping "backwards"
+		startIndex--
+		endIndex--
 	}
 
 	var res []*loggregator_v2.Envelope
-	traverser(tree.(*storage).Root, start.UnixNano(), end.UnixNano(), func(e *loggregator_v2.Envelope) bool {
-		e = store.filterByName(e, nameFilter)
+	for i := startIndex; i != endIndex && len(res) < limit; i += step {
+		e_ := queue.At(i)
+		e := store.filterByName(&e_, nameFilter)
 		if e == nil {
-			return false
+			continue
 		}
 
 		if store.validEnvelopeType(e, envelopeTypes) {
 			res = append(res, e)
 		}
-
-		// Return true to stop traversing
-		return len(res) >= limit
-	})
+	}
 
 	store.metrics.egress.Add(float64(len(res)))
 	return res
@@ -430,81 +457,6 @@ func (s *Store) validEnvelopeType(e *loggregator_v2.Envelope, types []logcache_v
 	return false
 }
 
-func (s *Store) treeAscTraverse(
-	n *avltree.Node,
-	start int64,
-	end int64,
-	f func(e *loggregator_v2.Envelope) bool,
-) bool {
-	if n == nil {
-		return false
-	}
-
-	e := n.Value.(*loggregator_v2.Envelope)
-	t := e.GetTimestamp()
-
-	if t >= start {
-		if s.treeAscTraverse(n.Children[0], start, end, f) {
-			return true
-		}
-
-		if (t >= end || f(e)) && !isNodeAFudgeSequenceMember(n, 1) {
-			return true
-		}
-	}
-
-	return s.treeAscTraverse(n.Children[1], start, end, f)
-}
-
-func isNodeAFudgeSequenceMember(node *avltree.Node, nextChildIndex int) bool {
-	e := node.Value.(*loggregator_v2.Envelope)
-	timestamp := e.GetTimestamp()
-
-	// check if node is internal to a fudge sequence
-	if timestamp != node.Key.(int64) {
-		return true
-	}
-
-	// node is not internal, but could initiate a fudge sequence, so
-	// check next child
-	nextChild := node.Children[nextChildIndex]
-	if nextChild == nil {
-		return false
-	}
-
-	// if next child exists, check it for fudge sequence membership.
-	// if the child's timestamps don't match, then the parent is the first
-	// member of a fudge sequence.
-	nextEnvelope := nextChild.Value.(*loggregator_v2.Envelope)
-	return (nextEnvelope.GetTimestamp() != nextChild.Key.(int64))
-}
-
-func (s *Store) treeDescTraverse(
-	n *avltree.Node,
-	start int64,
-	end int64,
-	f func(e *loggregator_v2.Envelope) bool,
-) bool {
-	if n == nil {
-		return false
-	}
-
-	e := n.Value.(*loggregator_v2.Envelope)
-	t := e.GetTimestamp()
-
-	if t < end {
-		if s.treeDescTraverse(n.Children[1], start, end, f) {
-			return true
-		}
-
-		if (t < start || f(e)) && !isNodeAFudgeSequenceMember(n, 0) {
-			return true
-		}
-	}
-
-	return s.treeDescTraverse(n.Children[0], start, end, f)
-}
-
 func (s *Store) checkEnvelopeType(e *loggregator_v2.Envelope, t logcache_v1.EnvelopeType) bool {
 	if t == logcache_v1.EnvelopeType_ANY {
 		return true
@@ -532,15 +484,15 @@ func (s *Store) checkEnvelopeType(e *loggregator_v2.Envelope, t logcache_v1.Enve
 func (store *Store) Meta() map[string]logcache_v1.MetaInfo {
 	metaReport := make(map[string]logcache_v1.MetaInfo)
 
-	store.storageIndex.Range(func(sourceId interface{}, tree interface{}) bool {
-		tree.(*storage).RLock()
+	store.storageIndex.Range(func(sourceId interface{}, queue interface{}) bool {
+		queue.(*storage).RLock()
 		metaReport[sourceId.(string)] = logcache_v1.MetaInfo{
-			Count:           int64(tree.(*storage).meta.GetCount()),
-			Expired:         tree.(*storage).meta.GetExpired(),
-			OldestTimestamp: tree.(*storage).meta.GetOldestTimestamp(),
-			NewestTimestamp: tree.(*storage).meta.GetNewestTimestamp(),
+			Count:           int64(queue.(*storage).meta.GetCount()),
+			Expired:         queue.(*storage).meta.GetExpired(),
+			OldestTimestamp: queue.(*storage).meta.GetOldestTimestamp(),
+			NewestTimestamp: queue.(*storage).meta.GetNewestTimestamp(),
 		}
-		tree.(*storage).RUnlock()
+		queue.(*storage).RUnlock()
 
 		return true
 	})
@@ -548,25 +500,27 @@ func (store *Store) Meta() map[string]logcache_v1.MetaInfo {
 	// Range over our local copy of metaReport
 	// TODO - shouldn't we just maintain Count on metaReport..?!
 	for sourceId := range metaReport {
-		tree, _ := store.storageIndex.Load(sourceId)
+		queue, _ := store.storageIndex.Load(sourceId)
 
-		tree.(*storage).RLock()
+		queue.(*storage).RLock()
 		metaReport[sourceId] = logcache_v1.MetaInfo{
-			Count:           int64(tree.(*storage).Size()),
-			Expired:         tree.(*storage).meta.GetExpired(),
-			OldestTimestamp: tree.(*storage).meta.GetOldestTimestamp(),
-			NewestTimestamp: tree.(*storage).meta.GetNewestTimestamp(),
+			Count:           int64(queue.(*storage).Len()),
+			Expired:         queue.(*storage).meta.GetExpired(),
+			OldestTimestamp: queue.(*storage).meta.GetOldestTimestamp(),
+			NewestTimestamp: queue.(*storage).meta.GetNewestTimestamp(),
 		}
-		tree.(*storage).RUnlock()
+		queue.(*storage).RUnlock()
 	}
 	return metaReport
 }
+
+type envDeque = deque.Deque[loggregator_v2.Envelope]
 
 type storage struct {
 	sourceId string
 	meta     logcache_v1.MetaInfo
 
-	*avltree.Tree
+	*envDeque
 	sync.RWMutex
 }
 
@@ -575,7 +529,7 @@ type ExpirationHeap []storageExpiration
 type storageExpiration struct {
 	timestamp int64
 	sourceId  string
-	tree      *storage
+	queue     *storage
 }
 
 func (h ExpirationHeap) Len() int           { return len(h) }
