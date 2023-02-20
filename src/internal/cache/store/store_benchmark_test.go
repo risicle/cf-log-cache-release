@@ -24,12 +24,12 @@ const (
 	MaxPerSource       = 1000000
 	TruncationInterval = 500 * time.Millisecond
 	PrunesPerGC        = int64(3)
+	LogStepDuration    = 1 * time.Millisecond
 )
 
 var (
 	MinTime     = time.Unix(0, 0)
 	MaxTime     = time.Unix(0, 9223372036854775807)
-	sourceIDs   = []string{"0", "1", "2", "3", "4"}
 	results     []*loggregator_v2.Envelope
 	metaResults map[string]logcache_v1.MetaInfo
 	genGet, genReset, genGetSync, genResetSync = randEnvGen(true)
@@ -359,7 +359,7 @@ func randEnvGen(deepCopyEnvelopes bool) (
 	startTimestamp := time.Now()
 	for i := 0; i < 10000; i++ {
 		s = append(s, benchBuildLog(
-			startTimestamp,
+			startTimestamp.Add(time.Duration(i) * LogStepDuration),
 		))
 	}
 
