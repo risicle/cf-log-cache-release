@@ -4,13 +4,10 @@ import (
 	"regexp"
 	"sync"
 	"sync/atomic"
-	"sort"
 	"time"
 
 	"code.cloudfoundry.org/go-log-cache/rpc/logcache_v1"
 	"code.cloudfoundry.org/go-loggregator/v9/rpc/loggregator_v2"
-
-	"github.com/gammazero/deque"
 )
 
 type envelopeQueue struct {
@@ -19,13 +16,13 @@ type envelopeQueue struct {
 
 	sync.RWMutex
 
-	envDeque *deque.Deque[loggregator_v2.Envelope]
+	envDeque *sortedDeque
 }
 
 func newEnvelopeQueue(sourceId string) *envelopeQueue {
 	return &envelopeQueue{
 		sourceId: sourceId,
-		envDeque: deque.New[loggregator_v2.Envelope](128, 128),
+		envDeque: newSortedDeque(128, 128),
 	}
 }
 
@@ -43,11 +40,7 @@ func (queue *envelopeQueue) insertOrSwap(store *Store, e *loggregator_v2.Envelop
 		store.metrics.storeSize.Set(float64(atomic.LoadInt64(&store.count)))
 	}
 
-	insertionIndex := sort.Search(queue.envDeque.Len(), func(i int) bool {
-		return queue.envDeque.At(i).Timestamp <= e.Timestamp
-	})
-
-	queue.envDeque.Insert(insertionIndex, *e)
+	queue.envDeque.InsortFront(*e)
 
 	if e.Timestamp > queue.meta.NewestTimestamp {
 		queue.meta.NewestTimestamp = e.Timestamp
@@ -117,12 +110,8 @@ func (queue *envelopeQueue) get(
 	queue.RLock()
 	defer queue.RUnlock()
 
-	startIndex := sort.Search(queue.envDeque.Len(), func(i int) bool {
-		return queue.envDeque.At(i).Timestamp < start.UnixNano()
-	})
-	endIndex := sort.Search(queue.envDeque.Len(), func(i int) bool {
-		return queue.envDeque.At(i).Timestamp < end.UnixNano()
-	})
+	startIndex := queue.envDeque.SearchBack(start.UnixNano())
+	endIndex := queue.envDeque.SearchBack(end.UnixNano())
 
 	var step int
 	if descending {
