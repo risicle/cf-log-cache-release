@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"bytes"
+	"math/bits"
 	"math/rand"
 	"fmt"
 	"runtime"
@@ -358,7 +359,7 @@ func randEnvGen(deepCopyEnvelopes bool) (
 	startTimestamp := time.Now()
 	for i := 0; i < 10000; i++ {
 		s = append(s, benchBuildLog(
-			startTimestamp.Add(time.Duration(i * 100) * time.Millisecond),
+			startTimestamp,
 		))
 	}
 
@@ -442,7 +443,7 @@ func benchBuildLog(baseTimestamp time.Time) *loggregator_v2.Envelope {
 func getRandomSourceId() string {
 	// cheap approx exponential distribution of smallish number of ids,
 	// padded to approx uuid size
-	return fmt.Sprintf("%16x", rand.Intn(6) * rand.Intn(6))
+	return fmt.Sprintf("%16x", bits.LeadingZeros32(rand.Uint32()))
 }
 
 type nopMetrics struct{}
