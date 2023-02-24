@@ -109,7 +109,7 @@ func benchmarkStoreGetTime5MinRange(b *testing.B, prunerMax int) {
 	genReset()
 	oldestTimestamp := MaxTime.UnixNano()
 	newestTimestamp := MinTime.UnixNano()
-	for i := 0; i < MaxPerSource/10; i++ {
+	for i := 0; i < MaxPerSource/2; i++ {
 		e := genGet()
 		if e.Timestamp < oldestTimestamp {
 			oldestTimestamp = e.Timestamp
@@ -132,10 +132,56 @@ func benchmarkStoreGetTime5MinRange(b *testing.B, prunerMax int) {
 			startTimestamp.Add(5 * time.Minute),
 			nil,
 			nil,
-			b.N,
+			1000,
 			false,
 		)
 	}
+}
+
+func BenchmarkStoreGetTime5MinRangeParallel(b *testing.B) {
+	benchmarkStoreGetTime5MinRangeParallel(b, 0)
+}
+
+func BenchmarkStoreGetTime5MinRangeParallelPruning(b *testing.B) {
+	benchmarkStoreGetTime5MinRangeParallel(b, 100)
+}
+
+func benchmarkStoreGetTime5MinRangeParallel(b *testing.B, prunerMax int) {
+	runtime.GC()
+	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
+
+	genReset()
+	oldestTimestamp := MaxTime.UnixNano()
+	newestTimestamp := MinTime.UnixNano()
+	for i := 0; i < MaxPerSource/2; i++ {
+		e := genGet()
+		if e.Timestamp < oldestTimestamp {
+			oldestTimestamp = e.Timestamp
+		}
+		if e.Timestamp > newestTimestamp {
+			newestTimestamp = e.Timestamp
+		}
+		s.Put(e, e.GetSourceId())
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			startTimestamp := time.Unix(
+				0,
+				rand.Int63n(1 + newestTimestamp - oldestTimestamp) + oldestTimestamp,
+			)
+			s.Get(
+				getRandomSourceId(),
+				startTimestamp,
+				startTimestamp.Add(5 * time.Minute),
+				nil,
+				nil,
+				1000,
+				false,
+			)
+		}
+	})
 }
 
 func BenchmarkStoreGetLogType(b *testing.B) {
@@ -151,7 +197,7 @@ func benchmarkStoreGetLogType(b *testing.B, prunerMax int) {
 	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
 
 	genReset()
-	for i := 0; i < MaxPerSource/10; i++ {
+	for i := 0; i < MaxPerSource/2; i++ {
 		e := genGet()
 		s.Put(e, e.GetSourceId())
 	}
@@ -166,10 +212,67 @@ func benchmarkStoreGetLogType(b *testing.B, prunerMax int) {
 			MaxTime,
 			logType,
 			nil,
-			b.N,
+			1000,
 			false,
 		)
 	}
+}
+
+func BenchmarkStoreGetTime5MinRangeWhileWriting(b *testing.B) {
+	benchmarkStoreGetTime5MinRangeWhileWriting(b, 0)
+}
+
+func BenchmarkStoreGetTime5MinRangeWhileWritingPruning(b *testing.B) {
+	benchmarkStoreGetTime5MinRangeWhileWriting(b, 1000)
+}
+
+func benchmarkStoreGetTime5MinRangeWhileWriting(b *testing.B, prunerMax int) {
+	runtime.GC()
+	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
+
+	genReset()
+	oldestTimestamp := genGet().Timestamp
+	newestTimestamp := oldestTimestamp
+	var newestTimestampAtomic atomic.Int64
+	newestTimestampAtomic.Store(newestTimestamp)
+
+	wReady := make(chan struct{}, 1)
+	go func() {
+		close(wReady)
+		for i := 0; i < b.N; i++ {
+			e := genGet()
+			// avoid reading newestTimestampAtomic if we don't need to
+			if e.Timestamp > newestTimestamp {
+				newestTimestamp = e.Timestamp
+				newestTimestampAtomic.Store(newestTimestamp)
+			}
+			s.Put(e, e.GetSourceId())
+		}
+	}()
+	<-wReady
+
+	b.ResetTimer()
+
+	done := make(chan struct{}, 1)
+	go func() {
+		for i := 0; i < b.N; i++ {
+			startTimestamp := time.Unix(
+				0,
+				rand.Int63n(1 + newestTimestampAtomic.Load() - oldestTimestamp) + oldestTimestamp,
+			)
+			results = s.Get(
+				getRandomSourceId(),
+				startTimestamp,
+				startTimestamp.Add(5 * time.Minute),
+				nil,
+				nil,
+				1000,
+				false,
+			)
+		}
+		close(done)
+	}()
+	<-done
 }
 
 func BenchmarkMeta(b *testing.B) {
@@ -185,13 +288,13 @@ func benchmarkMeta(b *testing.B, prunerMax int) {
 	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
 
 	genReset()
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < MaxPerSource/2; i++ {
 		e := genGet()
 		s.Put(e, e.GetSourceId())
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N * 5; i++ {
+	for i := 0; i < b.N; i++ {
 		metaResults = s.Meta()
 	}
 }
@@ -276,63 +379,6 @@ func benchmarkMetaWhileReading(b *testing.B, prunerMax int) {
 	for i := 0; i < b.N * 5; i++ {
 		metaResults = s.Meta()
 	}
-}
-
-func BenchmarkReadingWhileWriting(b *testing.B) {
-	benchmarkReadingWhileWriting(b, 0)
-}
-
-func BenchmarkReadingWhileWritingPruning(b *testing.B) {
-	benchmarkReadingWhileWriting(b, 1000)
-}
-
-func benchmarkReadingWhileWriting(b *testing.B, prunerMax int) {
-	runtime.GC()
-	s := store.NewStore(MaxPerSource, TruncationInterval, PrunesPerGC, &staticPruner{prunerMax}, nopMetrics{})
-
-	genReset()
-	oldestTimestamp := genGet().Timestamp
-	newestTimestamp := oldestTimestamp
-	var newestTimestampAtomic atomic.Int64
-	newestTimestampAtomic.Store(newestTimestamp)
-
-	wReady := make(chan struct{}, 1)
-	go func() {
-		close(wReady)
-		for i := 0; i < b.N; i++ {
-			e := genGet()
-			// avoid reading newestTimestampAtomic if we don't need to
-			if e.Timestamp > newestTimestamp {
-				newestTimestamp = e.Timestamp
-				newestTimestampAtomic.Store(newestTimestamp)
-			}
-			s.Put(e, e.GetSourceId())
-		}
-	}()
-	<-wReady
-
-	b.ResetTimer()
-
-	done := make(chan struct{}, 1)
-	go func() {
-		for i := 0; i < b.N; i++ {
-			startTimestamp := time.Unix(
-				0,
-				rand.Int63n(1 + newestTimestampAtomic.Load() - oldestTimestamp) + oldestTimestamp,
-			)
-			results = s.Get(
-				getRandomSourceId(),
-				startTimestamp,
-				startTimestamp.Add(5 * time.Minute),
-				nil,
-				nil,
-				b.N,
-				false,
-			)
-		}
-		close(done)
-	}()
-	<-done
 }
 
 func deepCopyEnvelope(srcEnv *loggregator_v2.Envelope) *loggregator_v2.Envelope {
